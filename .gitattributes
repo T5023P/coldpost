@@ -1,0 +1,9 @@
+# Shell scripts and container files must stay LF: they run on the Ubuntu VM,
+# and a CRLF shebang fails there with "bad interpreter".
+* text=auto eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.png binary
+*.jpg binary

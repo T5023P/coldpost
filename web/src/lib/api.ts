@@ -1,6 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from './supabase';
 
+// In production the frontend is served by Cloudflare Pages and the API lives on
+// https://api.coldpost.delivery, so every request needs an absolute base URL.
+// Empty value keeps the same-origin behaviour used by local development.
+const env = ((import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {}) as Record<
+  string,
+  string | undefined
+>;
+
+export const API_BASE = (env.VITE_API_BASE_URL ?? '').trim().replace(/\/+$/, '');
+
+/** Absolute URL for an API or upload path; leaves absolute URLs untouched. */
+export function apiUrl(path: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
+  return `${API_BASE}${path}`;
+}
+
 export class ApiError extends Error {
   status: number;
   details?: unknown;
@@ -19,7 +35,7 @@ type Options = {
 };
 
 export async function api<T = any>(path: string, options: Options = {}): Promise<T> {
-  const init: RequestInit = { method: options.method ?? 'GET', credentials: 'same-origin' };
+  const init: RequestInit = { method: options.method ?? 'GET', credentials: API_BASE ? 'include' : 'same-origin' };
   const headers: Record<string, string> = { ...(options.headers ?? {}) };
   if (options.formData) {
     init.body = options.formData;
@@ -40,7 +56,7 @@ export async function api<T = any>(path: string, options: Options = {}): Promise
   init.headers = headers;
   let response: Response;
   try {
-    response = await fetch(path.startsWith('/api') || path.startsWith('/uploads') ? path : `/api${path}`, init);
+    response = await fetch(apiUrl(path.startsWith('/api') || path.startsWith('/uploads') ? path : `/api${path}`), init);
   } catch {
     throw new ApiError(0, 'Cannot reach the Cold Post server. Is it running?');
   }
@@ -104,7 +120,7 @@ export function useApi<T = any>(path: string | null, deps: unknown[] = []) {
 
 export function downloadCsv(path: string, filename: string) {
   const link = document.createElement('a');
-  link.href = path;
+  link.href = apiUrl(path);
   link.download = filename;
   document.body.appendChild(link);
   link.click();

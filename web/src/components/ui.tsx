@@ -1,3 +1,4 @@
+import { apiUrl } from '../lib/api';
 import {
   createContext,
   useCallback,
@@ -374,11 +375,11 @@ export function PhotoGrid({ attachments, onDelete }: { attachments: any[]; onDel
       {attachments.map((attachment) => (
         <div className="photo" key={attachment.id}>
           {attachment.mime?.startsWith('image/') ? (
-            <a href={`/uploads/${attachment.file_path}`} target="_blank" rel="noreferrer">
-              <img src={`/uploads/${attachment.file_path}`} alt={attachment.caption || attachment.file_name} />
+            <a href={apiUrl(`/uploads/${attachment.file_path}`)} target="_blank" rel="noreferrer">
+              <img src={apiUrl(`/uploads/${attachment.file_path}`)} alt={attachment.caption || attachment.file_name} />
             </a>
           ) : (
-            <a href={`/uploads/${attachment.file_path}`} target="_blank" rel="noreferrer" className="small" style={{ display: 'flex', height: '100%', alignItems: 'center', justifyContent: 'center', padding: 8, textAlign: 'center' }}>
+            <a href={apiUrl(`/uploads/${attachment.file_path}`)} target="_blank" rel="noreferrer" className="small" style={{ display: 'flex', height: '100%', alignItems: 'center', justifyContent: 'center', padding: 8, textAlign: 'center' }}>
               {attachment.file_name}
             </a>
           )}

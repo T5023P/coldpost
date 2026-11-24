@@ -1,0 +1,133 @@
+name: CI and production deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Build and acceptance tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Acceptance tests against a throwaway database
+        run: |
+          set -euo pipefail
+          export DATA_DIR="$RUNNER_TEMP/cpdata"
+          PORT=4100 NODE_ENV=test DISABLE_AUTO_BACKUPS=1 npm start > "$RUNNER_TEMP/api.log" 2>&1 &
+          for _ in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:4100/health > /dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:4100/health
+          TEST_BASE=http://127.0.0.1:4100 npm run test:reset
+          cat "$RUNNER_TEMP/api.log" | tail -20
+
+  deploy:
+    name: Deploy to Oracle Always Free
+    needs: verify
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Require deployment secrets
+        run: |
+          set -euo pipefail
+          missing=""
+          for name in OCI_DEPLOY_HOST OCI_DEPLOY_USER OCI_DEPLOY_SSH_KEY OCI_DEPLOY_KNOWN_HOSTS; do
+            eval "value=\${$name:-}"
+            if [ -z "$value" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            exit 1
+          fi
+        env:
+          OCI_DEPLOY_HOST: ${{ secrets.OCI_DEPLOY_HOST }}
+          OCI_DEPLOY_USER: ${{ secrets.OCI_DEPLOY_USER }}
+          OCI_DEPLOY_SSH_KEY: ${{ secrets.OCI_DEPLOY_SSH_KEY }}
+          OCI_DEPLOY_KNOWN_HOSTS: ${{ secrets.OCI_DEPLOY_KNOWN_HOSTS }}
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.OCI_DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "${{ secrets.OCI_DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Sync release to the VM
+        run: |
+          set -euo pipefail
+          rsync -az --delete \
+            --exclude '.git' --exclude 'node_modules' --exclude 'data' \
+            --exclude 'web/dist' --exclude '.env*' --exclude '*.log' \
+            -e "ssh -i ~/.ssh/id_deploy -o UserKnownHostsFile=$HOME/.ssh/known_hosts" \
+            ./ "${{ secrets.OCI_DEPLOY_USER }}@${{ secrets.OCI_DEPLOY_HOST }}:/opt/coldpost/"
+
+      - name: Build, restart and health-check
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            "${{ secrets.OCI_DEPLOY_USER }}@${{ secrets.OCI_DEPLOY_HOST }}" \
+            "cd /opt/coldpost && bash deploy/release.sh '${GITHUB_SHA::7}'"
+
+      - name: Verify the public API
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 10 --retry-delay 6 https://api.coldpost.delivery/health
+
+      - name: Build frontend for Cloudflare Pages
+        env:
+          VITE_API_BASE_URL: https://api.coldpost.delivery
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
+        run: npm run build
+
+      - name: Publish frontend to the existing Pages project
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_DEPLOY_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "Skipping: CLOUDFLARE_PAGES_DEPLOY_TOKEN is not configured."
+            exit 0
+          fi
+          npx --yes wrangler@4 pages deploy web/dist --project-name coldpost --branch main

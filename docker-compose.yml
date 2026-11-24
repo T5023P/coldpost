@@ -1,0 +1,34 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: coldpost-api:latest
+    container_name: coldpost-api
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      PORT: "4100"
+      DATA_DIR: /app/data
+    # The API is only reachable on loopback; Cloudflare Tunnel publishes it.
+    ports:
+      - "127.0.0.1:4100:4100"
+    volumes:
+      - /var/lib/coldpost/data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

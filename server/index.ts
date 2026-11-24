@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import 'dotenv/config';
-import { ROOT, UPLOAD_DIR, migrate } from './db.js';
+import { ROOT, UPLOAD_DIR, get, migrate } from './db.js';
 import { attachUser } from './lib/auth.js';
 import { ApiError } from './lib/http.js';
 import { authRouter } from './routes/auth.js';
@@ -23,6 +23,7 @@ import { reportsRouter } from './routes/reports.js';
 import { settingsRouter } from './routes/settings.js';
 import { uploadsRouter } from './routes/uploads.js';
 import { ensureProviderRows } from './providers/service.js';
+import { supabaseAuthEnabled } from './lib/supabaseAuth.js';
 import { ensureSeed } from './seed.js';
 
 const usePg = !!process.env.DATABASE_URL;
@@ -42,27 +43,87 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '3mb' }));
+
+// Origins allowed to call the API from a browser. The frontend is served by
+// Cloudflare Pages while the API lives on api.coldpost.delivery, so the two
+// hosts differ and CORS is required. Only these exact origins are accepted.
+const allowedOrigins = new Set<string>();
+for (const entry of (process.env.CORS_ALLOWED_ORIGINS ?? '').split(',')) {
+  const origin = entry.trim().replace(/\/+$/, '');
+  if (origin) allowedOrigins.add(origin);
+}
+for (const fallback of [
+  process.env.FRONTEND_URL,
+  'https://coldpost.delivery',
+  'https://www.coldpost.delivery',
+  'https://coldpost.pages.dev',
+]) {
+  const origin = (fallback ?? '').trim().replace(/\/+$/, '');
+  if (origin) allowedOrigins.add(origin);
+}
+
+const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
+
+/** True when the browser origin is the API's own host or an allowlisted frontend. */
+function originAllowed(origin: string, requestHost: string): boolean {
+  if (allowedOrigins.has(origin)) return true;
+  try {
+    const parsed = new URL(origin);
+    const host = requestHost.split(':')[0];
+    if (parsed.hostname === host) return true;
+    return LOOPBACK_HOSTS.includes(parsed.hostname) && LOOPBACK_HOSTS.includes(host);
+  } catch {
+    return false;
+  }
+}
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && originAllowed(origin, req.headers.host ?? '')) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type, apikey, x-client-info');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Max-Age', '600');
+  }
+  if (req.method === 'OPTIONS') {
+    // Preflight from an unknown origin gets no CORS headers, so the browser
+    // refuses to send the real request.
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
+
+// Unauthenticated liveness/readiness probe used by Docker and the tunnel.
+app.get('/health', (_req, res) => {
+  let sqlite = 'ok';
+  try {
+    get('SELECT 1 AS ok');
+  } catch (error) {
+    sqlite = `error: ${(error as Error).message}`;
+  }
+  const healthy = sqlite === 'ok';
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? 'ok' : 'degraded',
+    service: 'coldpost-api',
+    sqlite,
+    supabaseAuth: supabaseAuthEnabled,
+    uptimeSeconds: Math.round(process.uptime()),
+    time: new Date().toISOString(),
+  });
+});
+
 app.use(attachUser);
 
 // Block cross-site state changes. Cookies are SameSite=Lax as a second layer.
 app.use('/api', (req, res, next) => {
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
     const origin = req.headers.origin;
-    if (origin) {
-      try {
-        const parsed = new URL(origin);
-        const host = (req.headers.host ?? '').split(':')[0];
-        const loopback = ['localhost', '127.0.0.1', '[::1]'];
-        const sameHost = parsed.hostname === host;
-        const bothLoopback = loopback.includes(parsed.hostname) && loopback.includes(host);
-        if (!sameHost && !bothLoopback) {
-          res.status(403).json({ error: 'Cross-origin request blocked' });
-          return;
-        }
-      } catch {
-        res.status(403).json({ error: 'Invalid origin' });
-        return;
-      }
+    if (origin && !originAllowed(origin, req.headers.host ?? '')) {
+      res.status(403).json({ error: 'Cross-origin request blocked' });
+      return;
     }
   }
   next();
