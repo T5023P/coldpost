@@ -82,7 +82,7 @@ export async function attachUser(req: Request, _res: Response, next: NextFunctio
     if (token) {
       const identity = await verifySupabaseToken(token);
       if (identity) {
-        const local = localUserForEmail(identity.email);
+        const local = await localUserForEmail(identity.email);
         if (local) req.user = local;
       }
     }

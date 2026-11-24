@@ -1,10 +1,8 @@
 -- Cold Post PostgreSQL schema — adapted from SQLite 001_init.sql
 -- Money stored in paise (integer) everywhere.
 
--- ============================================
--- Extensions
--- ============================================
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- Supabase already provides the extensions we need; the `postgres` role is not
+-- a superuser, so no CREATE EXTENSION here.
 
 -- ============================================
 -- Enum types
@@ -377,7 +375,7 @@ CREATE TABLE shipments (
   order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
   recipient_id INTEGER NOT NULL REFERENCES recipients(id) ON DELETE CASCADE,
   mode TEXT NOT NULL DEFAULT 'manual',
-  provider_id INTEGER REFERENCES api_providers(id) ON DELETE SET NULL,
+  provider_id INTEGER, -- FK added after api_providers is created
   courier_name TEXT,
   service TEXT,
   awb TEXT,
@@ -394,7 +392,7 @@ CREATE TABLE shipments (
   pod_path TEXT,
   exception_details TEXT,
   idempotency_key TEXT UNIQUE,
-  api_log_id INTEGER REFERENCES api_logs(id) ON DELETE SET NULL,
+  api_log_id INTEGER, -- FK added after api_logs is created
   created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -432,11 +430,11 @@ CREATE TABLE messages (
   to_phone TEXT,
   body TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'prepared',
-  provider_id INTEGER REFERENCES api_providers(id) ON DELETE SET NULL,
+  provider_id INTEGER, -- FK added after api_providers is created
   provider_ref TEXT,
   error TEXT,
   idempotency_key TEXT UNIQUE,
-  api_log_id INTEGER REFERENCES api_logs(id) ON DELETE SET NULL,
+  api_log_id INTEGER, -- FK added after api_logs is created
   sent_at TIMESTAMPTZ,
   sent_confirmed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
   created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -517,7 +515,7 @@ CREATE TABLE api_secrets (
 
 CREATE TABLE api_logs (
   id SERIAL PRIMARY KEY,
-  provider_id INTEGER REFERENCES api_providers(id) ON DELETE SET NULL,
+  provider_id INTEGER, -- FK added after api_providers is created
   action TEXT NOT NULL,
   environment TEXT,
   status TEXT NOT NULL,
@@ -545,6 +543,20 @@ CREATE TABLE audit_logs (
   manual_override BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ============================================
+-- Deferred foreign keys
+-- shipments/messages are declared before api_providers/api_logs, so their
+-- provider references are attached here instead of inline.
+-- ============================================
+ALTER TABLE shipments ADD CONSTRAINT shipments_provider_id_fkey
+  FOREIGN KEY (provider_id) REFERENCES api_providers(id) ON DELETE SET NULL;
+ALTER TABLE shipments ADD CONSTRAINT shipments_api_log_id_fkey
+  FOREIGN KEY (api_log_id) REFERENCES api_logs(id) ON DELETE SET NULL;
+ALTER TABLE messages ADD CONSTRAINT messages_provider_id_fkey
+  FOREIGN KEY (provider_id) REFERENCES api_providers(id) ON DELETE SET NULL;
+ALTER TABLE messages ADD CONSTRAINT messages_api_log_id_fkey
+  FOREIGN KEY (api_log_id) REFERENCES api_logs(id) ON DELETE SET NULL;
 
 -- ============================================
 -- Indexes

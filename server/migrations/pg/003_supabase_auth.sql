@@ -53,7 +53,11 @@ BEGIN
     COALESCE(p.full_name, p.email),
     p.email,
     '!supabase-auth',      -- no local password; sign-in happens via Supabase Auth
-    p.role::role_enum,
+    CASE p.role
+      WHEN 'admin' THEN 'admin'::public.role_enum
+      WHEN 'ops' THEN 'ops'::public.role_enum
+      ELSE 'viewer'::public.role_enum
+    END,
     p.is_active
   )
   ON CONFLICT (lower(email)) DO UPDATE

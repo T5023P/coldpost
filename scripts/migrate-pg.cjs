@@ -1,154 +1,94 @@
-// Simple PostgreSQL schema migration script for Supabase
-// Run with: node scripts/migrate-pg.cjs
-import { Pool } from 'pg';
-import fs from 'node:fs';
-import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+// Applies the PostgreSQL schema in server/migrations/pg/ to the database in
+// DATABASE_URL, in filename order, each file in its own transaction.
+// Applied files are recorded in public.schema_migrations so re-running is safe.
+//
+//   node scripts/migrate-pg.cjs            # apply pending migrations
+//   node scripts/migrate-pg.cjs --status   # show what is applied
+//
+// Schema only: this does not copy rows out of the local SQLite database.
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const fs = require('node:fs');
+const path = require('node:path');
+const { Pool } = require('pg');
+
+const ROOT = path.resolve(__dirname, '..');
+const MIGRATION_DIR = path.join(ROOT, 'server', 'migrations', 'pg');
+
+const DATABASE_URL = process.env.DATABASE_URL || process.env.SUPABASE_DB_URL;
 if (!DATABASE_URL) {
-  console.error('ERROR: DATABASE_URL environment variable not set');
+  console.error('ERROR: DATABASE_URL is not set (postgresql://user:pass@host:5432/postgres)');
   process.exit(1);
 }
 
-console.log('=== Cold Post: Apply PostgreSQL Schema to Supabase ===\n');
-
-// Initialize PostgreSQL connection
-const pgPool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
-
-// Initialize SQLite reader for data migration
-const ROOT = path.resolve(path.join(__dirname, '..', 'server', '..'));
-const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT, 'data');
-const dbPath = path.join(DATA_DIR, 'coldpost.db');
-const sqliteDb = new DatabaseSync(dbPath);
-
 async function main() {
+  const statusOnly = process.argv.includes('--status');
+  const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  const client = await pool.connect();
+
   try {
-    // Step 1: Apply the PostgreSQL schema
-    console.log('--- Step 1: Applying PostgreSQL schema ---');
-    const migrationDir = path.join(ROOT, 'server', 'migrations');
-    const sql = fs.readFileSync(path.join(migrationDir, '002_postgresql.sql'), 'utf8');
-    
-    // Execute the schema migration
-    await pgPool.query(sql);
-    console.log('  ✓ Schema 002_postgresql.sql applied successfully');
+    await client.query(
+      `CREATE TABLE IF NOT EXISTS public.schema_migrations (
+         name text PRIMARY KEY,
+         applied_at timestamptz NOT NULL DEFAULT now()
+       )`,
+    );
 
-    // Step 2: Create schema_migrations tracking table
-    console.log('\n--- Step 2: Setting up migration tracking ---');
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        name TEXT PRIMARY KEY,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    
-    // Mark the migration as applied
-    await pgPool.query(
-      `INSERT INTO schema_migrations (name) VALUES ('002_postgresql.sql') ON CONFLICT DO NOTHING`
-    );
-    console.log('  ✓ Migration tracking table created');
+    const { rows: applied } = await client.query('SELECT name FROM public.schema_migrations');
+    const done = new Set(applied.map((r) => r.name));
 
-    // Step 3: Migrate data from SQLite to PostgreSQL
-    console.log('\n--- Step 3: Migrating data from SQLite to PostgreSQL ---');
-    
-    // Get all table names from SQLite
-    const tables = sqliteDb.all(
-      `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`
-    );
-    
-    const tablesToMigrate = tables.map(t => t.name).filter(t => 
-      !['schema_migrations'].includes(t) // Skip tracking table
-    );
-    
-    let totalRows = 0;
-    
-    for (const tableName of tablesToMigrate) {
-      // Check if table exists in PG
-      const { rows: [{ exists } }] = await pgPool.query(
-        `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)`,
-        [tableName]
-      );
-      
-      if (!exists) {
-        console.log(`  ⊘ Table ${tableName} not in PG — creating from schema`);
-        // The schema already created this, skip
-        continue;
-      }
-      
-      // Check row count in PG
-      const { rows: [{ count } ]} = await pgPool.query(
-        `SELECT COUNT(*) FROM "${tableName}"`
-      );
-      
-      if (count && parseInt(count) > 0) {
-        console.log(`  ⊘ Table ${tableName} already has data (${count} rows) — skipping`);
-        continue;
-      }
-      
-      // Get data from SQLite
-      const rows = sqliteDb.all(`SELECT * FROM "${tableName}"`);
-      if (rows.length === 0) {
-        console.log(`  ℹ No data in SQLite table ${tableName} — skipping`);
-        continue;
-      }
-      
-      console.log(`  Migrating ${rows.length} rows from SQLite ${tableName} → PostgreSQL`);
-      
-      // Get column names from first row
-      const columns = Object.keys(rows[0]);
-      
-      // Insert rows in batches
-      for (const row of rows) {
-        const colNames = columns.map(c => `"${c}"`).join(', ');
-        const placeholders = columns.map((_, i) => `$${i + 1}`).join(', ');
-        const values = columns.map(c => {
-          const v = row[c];
-          if (v === null || v === undefined) return null;
-          if (typeof v === 'boolean') return v ? true : false;
-          if (typeof v === 'number') return v;
-          if (typeof v === 'string') return v;
-          return String(v);
-        });
-        
-        try {
-          await pgPool.query(
-            `INSERT INTO "${tableName}" (${colNames}) VALUES (${placeholders})`,
-            values
-          );
-          totalRows++;
-        } catch (err) {
-          console.warn(`  ⚠ Failed row in ${tableName}: ${err.message.substring(0, 60)}`);
-        }
-      }
-      console.log(`  ✓ Migrated ${rows.length} rows for ${tableName}`);
+    const files = fs
+      .readdirSync(MIGRATION_DIR)
+      .filter((f) => f.endsWith('.sql'))
+      .sort();
+
+    if (files.length === 0) {
+      console.log('No .sql files in', MIGRATION_DIR);
+      return;
     }
-    
-    console.log(`\n  Total rows migrated: ${totalRows}`);
 
-    // Step 4: Verify the connection
-    console.log('\n--- Step 4: Verification ---');
-    const { rows } = await pgPool.query('SELECT version() as pg_version, current_database() as db_name');
-    console.log(`  ✓ PostgreSQL version: ${rows[0].pg_version}`);
-    console.log(`  ✓ Connected to database: ${rows[0].db_name}`);
-    
-    // Close connections
-    await pgPool.end();
-    sqliteDb.close();
-    
-    console.log('\n=== Migration Complete ===');
-    console.log('1. Schema applied to Supabase PostgreSQL');
-    console.log('2. Data migrated from SQLite to PostgreSQL');
-    console.log('3. Migration tracked in schema_migrations table');
-    console.log('\nNext: Set up Supabase Storage buckets and verify the app works.');
-    
-  } catch (err) {
-    console.error('Migration failed:', err);
-    await pgPool.end();
-    process.exit(1);
+    if (statusOnly) {
+      for (const f of files) console.log(done.has(f) ? 'applied ' : 'pending ', f);
+      return;
+    }
+
+    for (const file of files) {
+      if (done.has(file)) {
+        console.log('skip    ', file, '(already applied)');
+        continue;
+      }
+      const sql = fs.readFileSync(path.join(MIGRATION_DIR, file), 'utf8');
+      try {
+        await client.query('BEGIN');
+        await client.query(sql);
+        await client.query('INSERT INTO public.schema_migrations (name) VALUES ($1)', [file]);
+        await client.query('COMMIT');
+        console.log('applied ', file);
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('FAILED  ', file);
+        console.error('  code:   ', err.code || '-');
+        console.error('  message:', err.message);
+        if (err.position) console.error('  at char:', err.position);
+        process.exitCode = 1;
+        return;
+      }
+    }
+
+    const { rows: tables } = await client.query(
+      `SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema = 'public'`,
+    );
+    const { rows: pending } = await client.query(
+      `SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'users'`,
+    );
+    console.log(`\npublic tables: ${tables[0].n}`);
+    console.log(pending[0].n ? 'users table present' : 'WARNING: users table missing');
+  } finally {
+    client.release();
+    await pool.end();
   }
 }
 
-main();
+main().catch((err) => {
+  console.error('Migration run failed:', err);
+  process.exit(1);
+});
