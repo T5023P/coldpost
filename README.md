@@ -168,3 +168,76 @@ scripts/acceptance.ts end-to-end acceptance suite
 - Single-tenant: one studio per installation (multiple users and cities are supported).
 - The SQLite database is suitable for a studio's volume; very high write concurrency
   would call for PostgreSQL.
+
+---
+
+## Production deployment
+
+### Architecture
+
+| Layer | Provider | Notes |
+| --- | --- | --- |
+| Source of truth | GitHub `T5023P/coldpost`, branch `main` | Must be a **private** repository |
+| Frontend | Cloudflare Pages, project `coldpost` | `web/dist` build output, domain `coldpost.delivery` |
+| Backend | Render (Node.js Express) | `npm run build` then `npm start`, binds `process.env.PORT` |
+| Database | Supabase PostgreSQL | Session-pooler connection string in `DATABASE_URL` |
+| Auth | Supabase Auth | Access token verified server-side; role comes from `public.users` |
+| Storage | Supabase Storage | Buckets `coldpost-products`, `coldpost-assemblies`, `coldpost-attachments` (all private) |
+
+### Local development (unchanged)
+
+```bash
+npm install
+npm run dev          # API on :4100, Vite on :5173
+npm test             # 29 acceptance checks against a running API
+```
+
+With `DATABASE_URL` unset the app uses local SQLite in `data/`. Login uses the
+cookie session created by `server/routes/auth.ts` and the seeded admin account.
+
+### Production authentication
+
+When `SUPABASE_URL` and `SUPABASE_ANON_KEY` are set, the frontend signs in with
+`supabase.auth.signInWithPassword` and sends the access token as
+`Authorization: Bearer <token>`. The API verifies that token against Supabase's
+`/auth/v1/user` endpoint and then resolves the role from the local `users` row
+matched by email. Browser-supplied emails and roles are never trusted.
+
+`public.profiles` mirrors `auth.users` and defaults every new account to
+`viewer`. Promotion is an explicit server-side action:
+
+```sql
+UPDATE public.profiles SET role = 'admin' WHERE lower(email) = lower('you@example.com');
+SELECT public.mirror_profile_to_users(id) FROM public.profiles WHERE lower(email) = lower('you@example.com');
+```
+
+### Database migrations
+
+Two separate sets, deliberately:
+
+- `server/migrations/*.sql` — SQLite, applied by `server/db.ts` in development.
+- `server/migrations/pg/*.sql` — PostgreSQL, applied to Supabase in filename order.
+
+The PostgreSQL files were moved into their own directory because the SQLite
+runner executes every `*.sql` file in its directory and aborted on PostgreSQL DDL.
+
+Do not point the acceptance suite at the production database; run it against a
+staging project or local SQLite.
+
+### Required production environment variables
+
+`DATABASE_URL`, `APP_SECRET`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`,
+`SUPABASE_SERVICE_ROLE_KEY` (server only), `NODE_ENV=production`,
+`COOKIE_SECURE=true`, `SEED_DEMO=false`, plus `VITE_SUPABASE_URL` and
+`VITE_SUPABASE_ANON_KEY` as Cloudflare Pages build variables.
+
+Secrets live in the host's encrypted environment settings. `.env` is gitignored;
+`.env.example` contains placeholders only.
+
+### Known gap
+
+`server/db.pg.ts` is not yet a working PostgreSQL adapter: it still uses `?`
+placeholders and its `tx()` helper does not open a transaction, and the route
+layer imports the SQLite module directly. PostgreSQL production mode therefore
+requires that adapter to be completed and tested before the API can be pointed at
+Supabase.
