@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from 'express';
 import { get, run } from '../db.js';
 import { randomToken, sha256, verifyPassword } from './crypto.js';
+import { bearerToken, localUserForEmail, supabaseAuthEnabled, verifySupabaseToken } from './supabaseAuth.js';
 
 export type Role = 'admin' | 'ops' | 'viewer';
 export type AuthedUser = { id: number; name: string; email: string; role: Role; active: number };
@@ -66,10 +67,27 @@ export function attemptLogin(email: string, password: string): AuthedUser | null
   return { id: row.id, name: row.name, email: row.email, role: row.role, active: row.active };
 }
 
-export function attachUser(req: Request, _res: Response, next: NextFunction) {
-  const token = sessionTokenFromRequest(req);
-  const user = userFromToken(token);
-  if (user) req.user = user;
+export async function attachUser(req: Request, _res: Response, next: NextFunction) {
+  // Local cookie sessions keep SQLite development mode working unchanged.
+  const cookieUser = userFromToken(sessionTokenFromRequest(req));
+  if (cookieUser) {
+    req.user = cookieUser;
+    return next();
+  }
+
+  // Production: verify the Supabase access token and take the role from the
+  // server-side user record. A browser-supplied role or email is never trusted.
+  if (supabaseAuthEnabled) {
+    const token = bearerToken(req);
+    if (token) {
+      const identity = await verifySupabaseToken(token);
+      if (identity) {
+        const local = localUserForEmail(identity.email);
+        if (local) req.user = local;
+      }
+    }
+  }
+
   next();
 }
 

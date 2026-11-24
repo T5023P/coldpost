@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { api } from './api';
+import { supabase, supabaseEnabled } from './supabase';
 
 export interface User {
   id: number;
@@ -37,15 +38,49 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     refresh();
     const onUnauthorized = () => setUser(null);
     window.addEventListener('cp:unauthorized', onUnauthorized);
-    return () => window.removeEventListener('cp:unauthorized', onUnauthorized);
+
+    // Session restoration after refresh: Supabase keeps the session in storage,
+    // re-read it and re-resolve the server-controlled profile.
+    let unsubscribe: (() => void) | undefined;
+    if (supabase) {
+      supabase.auth.getSession().then(({ data }) => {
+        if (data.session) refresh();
+      });
+      const { data } = supabase.auth.onAuthStateChange((event, session) => {
+        if (event === 'SIGNED_OUT' || !session) setUser(null);
+        else if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') refresh();
+      });
+      unsubscribe = () => data.subscription.unsubscribe();
+    }
+
+    return () => {
+      window.removeEventListener('cp:unauthorized', onUnauthorized);
+      unsubscribe?.();
+    };
   }, [refresh]);
 
-  const login = useCallback(async (email: string, password: string) => {
-    const data = await api<{ user: User }>('/auth/login', { method: 'POST', body: { email, password } });
-    setUser(data.user);
-  }, []);
+  const login = useCallback(
+    async (email: string, password: string) => {
+      if (supabaseEnabled && supabase) {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw new Error(error.message);
+        // The role always comes from the server-side profile, never the browser.
+        const data = await api<{ user: User | null }>('/auth/me');
+        if (!data.user) {
+          await supabase.auth.signOut().catch(() => undefined);
+          throw new Error('This account has no Cold Post profile. Ask an administrator to grant access.');
+        }
+        setUser(data.user);
+        return;
+      }
+      const data = await api<{ user: User }>('/auth/login', { method: 'POST', body: { email, password } });
+      setUser(data.user);
+    },
+    [],
+  );
 
   const logout = useCallback(async () => {
+    if (supabase) await supabase.auth.signOut().catch(() => undefined);
     await api('/auth/logout', { method: 'POST' }).catch(() => undefined);
     setUser(null);
   }, []);

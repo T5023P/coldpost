@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { supabase } from './supabase';
 
 export class ApiError extends Error {
   status: number;
@@ -25,6 +26,16 @@ export async function api<T = any>(path: string, options: Options = {}): Promise
   } else if (options.body !== undefined) {
     headers['content-type'] = 'application/json';
     init.body = JSON.stringify(options.body);
+  }
+  // Production auth: send the Supabase access token so the API can verify it.
+  if (supabase) {
+    try {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (token) headers.authorization = `Bearer ${token}`;
+    } catch {
+      /* signed out or storage unavailable */
+    }
   }
   init.headers = headers;
   let response: Response;
